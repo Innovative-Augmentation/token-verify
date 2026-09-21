@@ -82,4 +82,4 @@ jobs:
       # commit and workflow run. It only works because this repository is public.
       # Deliberately no NODE_AUTH_TOKEN: if one is set, npm takes the legacy token
       # path instead of OIDC.
-      - run: npm stage publish --provenance --access public --loglevel verbose
+      - run: npm stage publish --provenance --access public
