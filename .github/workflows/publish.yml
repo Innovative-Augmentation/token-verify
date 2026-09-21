@@ -31,10 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NO `registry-url:` here, deliberately. setup-node reacts to it by writing an
+      # .npmrc containing `_authToken=${NODE_AUTH_TOKEN}` and exporting that variable
+      # as the literal placeholder XXXXX-XXXXX-XXXXX-XXXXX. npm then sees a token,
+      # takes the legacy auth path instead of OIDC, and fails with E401 — which reads
+      # like a credentials problem when the real cause is that a credential exists at
+      # all. The registry comes from publishConfig in package.json instead.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: https://registry.npmjs.org
 
       # Node 20 bundles npm 10, which has no `stage` command. Pinned rather than
       # left to whatever the runner ships.
