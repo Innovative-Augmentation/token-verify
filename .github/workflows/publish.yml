@@ -47,6 +47,19 @@ jobs:
 
       - run: npm ci
 
+      # Trusted publishing needs npm >= 11.5.1 and the two ACTIONS_ID_TOKEN_* vars
+      # that `id-token: write` injects. When either is missing npm does not warn —
+      # it quietly falls back to token auth and fails with ENEEDAUTH, which names
+      # the symptom and not the cause.
+      - name: OIDC preflight
+        run: |
+          echo "npm:  $(npm --version)"
+          echo "node: $(node --version)"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "NODE_AUTH_TOKEN set: ${NODE_AUTH_TOKEN:+yes}${NODE_AUTH_TOKEN:-NO}"
+          npm config get registry
+
       # Never publish something that has not passed its own tests.
       - run: npm test
 
@@ -69,4 +82,4 @@ jobs:
       # commit and workflow run. It only works because this repository is public.
       # Deliberately no NODE_AUTH_TOKEN: if one is set, npm takes the legacy token
       # path instead of OIDC.
-      - run: npm stage publish --provenance --access public
+      - run: npm stage publish --provenance --access public --loglevel verbose
