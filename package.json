@@ -1,0 +1,28 @@
+{
+  "name": "@innovative-augmentation/token-verify",
+  "version": "0.2.0",
+  "description": "Shared JWT verification for the IAL platform and tenant services. One implementation, validated identically across repos and languages.",
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^3.1.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Innovative-Augmentation/token-verify.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  }
+}

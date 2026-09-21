@@ -1,0 +1,67 @@
+name: publish
+
+# Publishes to the public npm registry. THIS repo is public specifically so
+# releases can carry provenance: npm refuses to verify a provenance bundle whose
+# source repository is private, which is why the package could not stay in the
+# platform monorepo — see plans/auth.md there.
+#
+# Releases are cut by tag, not by merging, so publishing is always a deliberate act
+# with a name attached.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag version must match package.json; the job fails if not, rather than
+# publishing something that disagrees with its own tag.
+#
+# NOTE: npm's trusted publisher binds to the REPOSITORY NAME and this workflow's
+# filename. Renaming either without updating the publisher at npmjs.com breaks
+# publishing — with a 404, which reads as "package missing" rather than "not
+# authorised". That misdirection has cost time before.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # OIDC to npm — trusted publishing, no long-lived token
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+
+      # Node 20 bundles npm 10, which has no `stage` command. Pinned rather than
+      # left to whatever the runner ships.
+      - run: npm i -g npm@11
+
+      - run: npm ci
+
+      # Never publish something that has not passed its own tests.
+      - run: npm test
+
+      - name: Check tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag $GITHUB_REF_NAME implies $TAG but package.json says $PKG" >&2
+            exit 1
+          fi
+          echo "Publishing $PKG"
+
+      # `npm stage publish`, not `npm publish`. The trusted publisher is stage-only,
+      # and npm rejects a direct publish from one with a 404 rather than a 403 —
+      # deliberately, so an unauthorised caller cannot learn whether a package
+      # exists. A person then approves the staged version at npmjs.com with 2FA.
+      #
+      # --provenance attaches a sigstore attestation binding the tarball to this
+      # commit and workflow run. It only works because this repository is public.
+      # Deliberately no NODE_AUTH_TOKEN: if one is set, npm takes the legacy token
+      # path instead of OIDC.
+      - run: npm stage publish --provenance --access public
