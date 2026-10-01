@@ -5,7 +5,11 @@ const assert = require('node:assert');
 const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 
-const { createVerifier, createCognitoAccessTokenVerifier } = require('../src/index.js');
+const {
+  createVerifier,
+  createCognitoAccessTokenVerifier,
+  DEFAULT_MAX_TOKEN_LIFETIME_SEC,
+} = require('../src/index.js');
 
 const KID = 'test-key-1';
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
@@ -41,6 +45,19 @@ function sign(payload, opts = {}) {
     ...opts.signOpts,
   });
 }
+
+// Signs an arbitrary payload exactly as given. jsonwebtoken's sign() validates
+// claim types and will not produce `exp: "never"` or `exp: null`, but a hostile
+// or broken issuer can — so the tests that matter here cannot go through it.
+function signRaw(payload) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const input = `${b64({ alg: 'RS256', typ: 'JWT', kid: KID })}.${b64(payload)}`;
+  const sig = crypto.sign('sha256', Buffer.from(input), privateKey).toString('base64url');
+  return `${input}.${sig}`;
+}
+
+const nowSec = () => Math.floor(Date.now() / 1000);
+const baseClaims = () => ({ sub: 'user-1', client_id: CLIENT_ID, token_use: 'access', iss: ISSUER });
 
 function cognitoVerifier(overrides = {}) {
   return createVerifier({
@@ -206,4 +223,137 @@ test('config errors fail loudly at construction', () => {
   assert.throws(() => createVerifier({ audience: 'a', jwksUri: 'u' }), /issuer is required/);
   assert.throws(() => createVerifier({ issuer: 'i', jwksUri: 'u' }), /audience is required/);
   assert.throws(() => createVerifier({ issuer: 'i', audience: 'a' }), /jwksUri is required/);
+});
+
+// ── Bounded lifetime (0.3.0) ────────────────────────────────────────────────
+// jsonwebtoken only checks `exp` when present. Each test below is a correctly
+// SIGNED token from the trusted key, so the signature cannot be what rejects it.
+
+test('control: the raw signer produces a token the verifier accepts', async () => {
+  // Without this, every rejection below could be the helper's fault, not the rule's.
+  const v = cognitoVerifier();
+  const iat = nowSec();
+  const claims = await v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 300 }));
+  assert.equal(claims.sub, 'user-1');
+});
+
+test('LIFETIME: rejects a correctly signed token with no exp', async () => {
+  const v = cognitoVerifier();
+  const token = signRaw({ ...baseClaims(), iat: nowSec() });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'no_expiry');
+});
+
+test('LIFETIME: rejects a non-numeric exp (string and null)', async () => {
+  const v = cognitoVerifier();
+  for (const exp of ['9999999999', 'never', null]) {
+    const token = signRaw({ ...baseClaims(), iat: nowSec(), exp });
+    await assert.rejects(() => v.verify(token), (e) => e.code === 'no_expiry', `exp=${JSON.stringify(exp)}`);
+  }
+});
+
+test('LIFETIME: rejects a token with no iat', async () => {
+  const v = cognitoVerifier();
+  const token = signRaw({ ...baseClaims(), exp: nowSec() + 300 });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'no_issued_at');
+});
+
+test('LIFETIME: rejects a non-numeric iat (string and null)', async () => {
+  // NaN cannot be written in JSON at all — JSON.stringify(NaN) is null — so null
+  // is how a NaN-producing issuer actually arrives.
+  const v = cognitoVerifier();
+  for (const iat of [String(nowSec()), null]) {
+    const token = signRaw({ ...baseClaims(), iat, exp: nowSec() + 300 });
+    await assert.rejects(() => v.verify(token), (e) => e.code === 'no_issued_at', `iat=${JSON.stringify(iat)}`);
+  }
+});
+
+test('LIFETIME: rejects a ten-year token', async () => {
+  const v = cognitoVerifier();
+  const token = sign(
+    { sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' },
+    { signOpts: { expiresIn: '3650d' } }
+  );
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+});
+
+test('LIFETIME: rejects a token expiring in the year 3000', async () => {
+  const v = cognitoVerifier();
+  const token = signRaw({ ...baseClaims(), iat: nowSec(), exp: Date.UTC(3000, 0, 1) / 1000 });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+});
+
+test('LIFETIME: rejects an iat pushed into the future to shrink exp - iat', async () => {
+  // The way round the ceiling: a far-future exp paired with an iat just below it.
+  const v = cognitoVerifier();
+  const iat = nowSec() + 10 * 365 * 24 * 3600;
+  const token = signRaw({ ...baseClaims(), iat, exp: iat + 300 });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'issued_in_future');
+});
+
+test('LIFETIME: an iat within clock tolerance is accepted, just beyond it is not', async () => {
+  const v = cognitoVerifier({ clockToleranceSec: 30 });
+  const within = nowSec() + 20;
+  await v.verify(signRaw({ ...baseClaims(), iat: within, exp: within + 300 }));
+  const beyond = nowSec() + 60;
+  await assert.rejects(
+    () => v.verify(signRaw({ ...baseClaims(), iat: beyond, exp: beyond + 300 })),
+    (e) => e.code === 'issued_in_future'
+  );
+});
+
+test('LIFETIME: the ceiling is inclusive — exactly max passes, one second over fails', async () => {
+  const v = cognitoVerifier({ maxTokenLifetimeSec: 3600 });
+  const iat = nowSec();
+  await v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 3600 }));
+  await assert.rejects(
+    () => v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 3601 })),
+    (e) => e.code === 'token_lifetime_exceeded'
+  );
+});
+
+test('LIFETIME: the default admits a genuine Entra-shaped token (90 min + 5 min backdated iat)', async () => {
+  // Entra issues 60-90 min and backdates iat ~5 min. A default that refused this
+  // would break Plane B for NE on upgrade.
+  assert.equal(DEFAULT_MAX_TOKEN_LIFETIME_SEC, 7200);
+  const v = cognitoVerifier();
+  const iat = nowSec() - 300;
+  await v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 95 * 60 }));
+});
+
+test('LIFETIME: a plane can set the ceiling lower than the default', async () => {
+  const v = cognitoVerifier({ maxTokenLifetimeSec: 30 * 60 });
+  const token = sign({ sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' }, { signOpts: { expiresIn: '60m' } });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+});
+
+test('LIFETIME: the wrappers pass maxTokenLifetimeSec through', async () => {
+  const v = createCognitoAccessTokenVerifier({
+    region: 'eu-west-2',
+    userPoolId: 'eu-west-2_TEST',
+    clientId: CLIENT_ID,
+    jwksClient: fakeJwks,
+    maxTokenLifetimeSec: 60,
+  });
+  const token = sign({ sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+});
+
+test('LIFETIME: a forged token with no exp still fails on its signature, not its lifetime', async () => {
+  // The lifetime codes must only ever describe tokens a trusted key signed.
+  const v = cognitoVerifier();
+  const token = jwt.sign({ ...baseClaims(), iat: nowSec() }, other.privateKey, { algorithm: 'RS256', keyid: KID });
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'invalid_token');
+});
+
+test('config: maxTokenLifetimeSec must be a positive finite number no greater than 24h', () => {
+  const base = { issuer: 'i', audience: 'a', jwksClient: fakeJwks };
+  for (const bad of [0, -1, NaN, Infinity, null, '3600', 24 * 3600 + 1]) {
+    assert.throws(
+      () => createVerifier({ ...base, maxTokenLifetimeSec: bad }),
+      /maxTokenLifetimeSec/,
+      `maxTokenLifetimeSec=${String(bad)}`
+    );
+  }
+  assert.ok(createVerifier({ ...base, maxTokenLifetimeSec: 24 * 3600 }));
+  assert.ok(createVerifier({ ...base, maxTokenLifetimeSec: 1 }));
 });

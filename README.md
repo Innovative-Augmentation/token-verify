@@ -62,18 +62,53 @@ expected.
 - **401s carry no detail.** The reason goes to `onError` for server-side logging (P1.10); the caller
   gets `{ error: 'unauthorized' }` and cannot probe for why a token was rejected.
 - Signature, `iss`, audience, `exp`/`nbf` and `token_use` are all checked.
+- **A token's lifetime must be bounded** (from 0.3.0). `jsonwebtoken` checks `exp` only when it is
+  present, so before 0.3.0 a correctly signed token with no `exp` — or one expiring in the year
+  3000 — was accepted for ever. Now `exp` and `iat` must both be numbers, `iat` may not be in the
+  future beyond `clockToleranceSec`, and `exp - iat` may not exceed `maxTokenLifetimeSec`. These run
+  only after the signature verifies, so the codes below only ever describe genuinely issued tokens.
+
+### Lifetime options and error codes
+
+| Option | Default | Notes |
+|---|---|---|
+| `maxTokenLifetimeSec` | `7200` (2 h) | Ceiling on `exp - iat`. Must be a positive number ≤ `86400`; anything else throws at construction. **Set it lower per plane** to match the issuer. |
+| `clockToleranceSec` | `5` | Applied to `exp`, `nbf` and the future-`iat` check alike. Not applied to `exp - iat`, which is the issuer's own arithmetic. |
+
+Two hours sits just above the longest *default* lifetime of either issuer: Cognito access tokens
+default to 60 min (the platform pool issues 30), and Entra access tokens are a random 60–90 min
+with `iat` backdated ~5 min, so `exp - iat` reaches about 95 min. A one-hour default would reject
+genuine Entra tokens. The 24 h hard cap is the most either issuer can be configured to mint.
+
+| `err.code` | Meaning |
+|---|---|
+| `no_expiry` | `exp` missing, or not a finite number (string, `null`) |
+| `no_issued_at` | `iat` missing, or not a finite number |
+| `issued_in_future` | `iat` later than now + `clockToleranceSec` |
+| `token_lifetime_exceeded` | `exp - iat` above `maxTokenLifetimeSec` |
+
+The codes match `@innovative-augmentation/session`, which applies the same rules at the
+platform's spine, so a log line means the same thing whichever layer refused.
+
+### Upgrading from 0.2.x
+
+`^0.2.0` does **not** pick up 0.3.0 — a caret on a `0.x` version pins the minor — so each consumer
+upgrades deliberately. On upgrade, any issuer minting tokens without `iat`, or longer than two
+hours, starts being refused: pass `maxTokenLifetimeSec` explicitly if the issuer is configured
+longer (and justify it), or lower to match a shorter one.
 - JWKS responses are cached and rate-limited.
 
 ## Tests
 
 ```
-npm test --workspace @innovative-augmentation/token-verify
+npm test
 ```
 
-Sixteen cases, no network: a fake JWKS client is injected via the `jwksClient` option. Coverage
+No network: a fake JWKS client is injected via the `jwksClient` option. Coverage
 includes the forgery paths (`alg: none`, wrong signing key, mismatched issuer/audience, expired,
-missing `kid`) and an explicit plane-separation case asserting a Plane B token fails against a
-Plane A verifier.
+missing `kid`), the lifetime rules (no `exp`, non-numeric `exp`/`iat`, missing `iat`, ten-year and
+year-3000 tokens, future `iat`, the ceiling boundary) and an explicit plane-separation case
+asserting a Plane B token fails against a Plane A verifier.
 
 ## Installing it from another repo
 

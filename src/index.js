@@ -22,6 +22,31 @@
 const jwt = require('jsonwebtoken');
 const jwksRsa = require('jwks-rsa');
 
+/**
+ * Ceiling on `exp - iat` when the caller sets none: two hours.
+ *
+ * Chosen to sit just above the longest DEFAULT lifetime either issuer we verify
+ * actually mints, so the default refuses nothing genuine and everything immortal:
+ *
+ *   Cognito access tokens   60 min by default (the platform pool issues 30).
+ *   Entra access tokens     a random 60-90 min, with `iat`/`nbf` backdated about
+ *                           5 min for skew, so `exp - iat` reaches roughly 95 min.
+ *
+ * One hour would therefore reject a large share of genuine Entra tokens; two
+ * leaves headroom without approaching "a day". Each plane is expected to set it
+ * LOWER to match its own issuer — the platform's session policy holds Plane A to
+ * 60 min (plans/session-security.md).
+ */
+const DEFAULT_MAX_TOKEN_LIFETIME_SEC = 2 * 60 * 60;
+
+/**
+ * The most `maxTokenLifetimeSec` may be raised to. A day is the longest either
+ * Cognito's app-client setting or an Entra token-lifetime policy can issue, so
+ * anything above it is not accommodating an issuer — it is reopening the hole
+ * this check closes, and is refused at construction rather than honoured.
+ */
+const MAX_TOKEN_LIFETIME_CEILING_SEC = 24 * 60 * 60;
+
 class TokenVerificationError extends Error {
   constructor(message, code) {
     super(message);
@@ -44,7 +69,12 @@ class TokenVerificationError extends Error {
  *                                       Cognito-specific; stops an ID token being presented
  *                                       where an access token is expected.
  * @param {string[]}[opts.algorithms]    Permitted algorithms. Defaults to RS256 only.
- * @param {number}  [opts.clockToleranceSec]
+ * @param {number}  [opts.clockToleranceSec] Allowed skew, applied to `exp`, `nbf` and
+ *                                       the issued-in-the-future check on `iat`.
+ * @param {number}  [opts.maxTokenLifetimeSec] Ceiling on `exp - iat`. Defaults to
+ *                                       DEFAULT_MAX_TOKEN_LIFETIME_SEC (2 h); must be a
+ *                                       positive number no greater than 24 h. Set it
+ *                                       lower per plane to match the issuer.
  * @param {number}  [opts.cacheMaxAgeMs] JWKS cache lifetime.
  * @param {object}  [opts.jwksClient]    Injectable key client (tests).
  */
@@ -59,6 +89,7 @@ function createVerifier(opts = {}) {
     // `alg` header — which is how algorithm-confusion and `alg: none` attacks work.
     algorithms = ['RS256'],
     clockToleranceSec = 5,
+    maxTokenLifetimeSec = DEFAULT_MAX_TOKEN_LIFETIME_SEC,
     cacheMaxAgeMs = 10 * 60 * 1000,
     jwksClient,
   } = opts;
@@ -66,6 +97,20 @@ function createVerifier(opts = {}) {
   if (!issuer) throw new TypeError('createVerifier: issuer is required');
   if (!audience) throw new TypeError('createVerifier: audience is required');
   if (!jwksUri && !jwksClient) throw new TypeError('createVerifier: jwksUri is required');
+  // Validated rather than trusted: `undefined` is replaced by the default above, but
+  // `null`, `'3600'`, NaN, 0 or Infinity would each make the comparison below
+  // quietly pass or quietly fail everything. A misconfigured ceiling should stop
+  // the process at boot, not decide token outcomes at runtime.
+  if (
+    typeof maxTokenLifetimeSec !== 'number' ||
+    !Number.isFinite(maxTokenLifetimeSec) ||
+    maxTokenLifetimeSec <= 0 ||
+    maxTokenLifetimeSec > MAX_TOKEN_LIFETIME_CEILING_SEC
+  ) {
+    throw new TypeError(
+      `createVerifier: maxTokenLifetimeSec must be a positive number of seconds no greater than ${MAX_TOKEN_LIFETIME_CEILING_SEC}`
+    );
+  }
 
   const client =
     jwksClient ||
@@ -110,6 +155,11 @@ function createVerifier(opts = {}) {
         if (err) {
           return reject(new TokenVerificationError(err.message, mapCode(err)));
         }
+
+        // Lifetime is checked only once the signature has verified, so these codes
+        // describe tokens a trusted issuer genuinely minted — never a forgery.
+        const lifetimeError = checkLifetime(claims, { maxTokenLifetimeSec, clockToleranceSec });
+        if (lifetimeError) return reject(lifetimeError);
 
         if (audienceClaim !== 'aud' && claims[audienceClaim] !== audience) {
           return reject(
@@ -168,7 +218,64 @@ function createVerifier(opts = {}) {
   return { verify, middleware };
 }
 
+/**
+ * jsonwebtoken checks `exp` only when it is present, and treats a token without
+ * one as never expiring. So a correctly signed token with no `exp` — or with one
+ * set in the year 3000 — was accepted for ever by anything holding a key we trust.
+ * Requiring `exp` alone would not close that: the far-future token is the same
+ * hole. Bounding `exp - iat` does, and that needs `iat`, so both are required.
+ *
+ * Absence and malformation are treated alike (a string, null, or anything not a
+ * finite number is "no exp"): an issuer that cannot write a NumericDate has not
+ * told us when the token ends either. The codes match @innovative-augmentation/
+ * session, which applies the same rules at the platform's spine, so a log line
+ * means the same thing whichever layer refused.
+ *
+ * Returns a TokenVerificationError, or null when the lifetime is acceptable.
+ */
+function checkLifetime(claims, { maxTokenLifetimeSec, clockToleranceSec }) {
+  const exp = numericDate(claims.exp);
+  if (exp === null) {
+    return new TokenVerificationError('token carries no numeric exp', 'no_expiry');
+  }
+
+  const iat = numericDate(claims.iat);
+  if (iat === null) {
+    return new TokenVerificationError(
+      'token carries no numeric iat, so its lifetime cannot be bounded',
+      'no_issued_at'
+    );
+  }
+
+  // Without this an issuer could set `iat` close to a far-future `exp` and pass the
+  // lifetime check below. The same tolerance as `exp`/`nbf`, so the three clock
+  // checks cannot disagree about whose clock is wrong.
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (iat > nowSec + clockToleranceSec) {
+    return new TokenVerificationError('token was issued in the future', 'issued_in_future');
+  }
+
+  // No tolerance here: both values come from the issuer's own clock, so skew
+  // between us and it does not enter into their difference.
+  const lifetimeSec = exp - iat;
+  if (lifetimeSec > maxTokenLifetimeSec) {
+    return new TokenVerificationError(
+      `token lifetime ${lifetimeSec}s exceeds the ${maxTokenLifetimeSec}s ceiling`,
+      'token_lifetime_exceeded'
+    );
+  }
+
+  return null;
+}
+
+function numericDate(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
 function mapCode(err) {
+  // jsonwebtoken refuses a present-but-non-numeric `exp` itself, before our own
+  // check runs. Same failure as a missing one, so the same code.
+  if (err.message === 'invalid exp value') return 'no_expiry';
   if (err.name === 'TokenExpiredError') return 'expired';
   if (err.name === 'NotBeforeError') return 'not_yet_valid';
   // jsonwebtoken wraps anything thrown by the key callback as "error in secret or
@@ -218,4 +325,6 @@ module.exports = {
   createCognitoAccessTokenVerifier,
   createEntraVerifier,
   TokenVerificationError,
+  DEFAULT_MAX_TOKEN_LIFETIME_SEC,
+  MAX_TOKEN_LIFETIME_CEILING_SEC,
 };

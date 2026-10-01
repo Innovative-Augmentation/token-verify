@@ -1,6 +1,6 @@
 {
   "name": "@innovative-augmentation/token-verify",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared JWT verification for the IAL platform and tenant services. One implementation, validated identically across repos and languages.",
   "main": "src/index.js",
   "files": [
