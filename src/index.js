@@ -15,8 +15,14 @@
  * distinct makes the planes structurally un-swappable rather than relying on care.
  *
  * This module authenticates only. It answers "who is this?" and never "may they?" —
- * roles are resolved server-side per request (P1.4/P1.7) and are deliberately absent
- * from the token so that revoking one takes effect on the next request.
+ * every failure here is a 401. What a Plane B caller may DO is the caller's
+ * decision, answered 403: `permissionsFor` only reads the grants out of a verified
+ * token, by the map the caller passes in. Plane A users' roles are resolved
+ * server-side per request (P1.4/P1.7).
+ *
+ * The checks are those of the token contract (token.contract.json, v1 as amended
+ * 2026-10-01). Error codes are the contract's `rejection_codes`, so a log line means
+ * the same thing whichever implementation wrote it.
  */
 
 const jwt = require('jsonwebtoken');
@@ -47,11 +53,16 @@ const DEFAULT_MAX_TOKEN_LIFETIME_SEC = 2 * 60 * 60;
  */
 const MAX_TOKEN_LIFETIME_CEILING_SEC = 24 * 60 * 60;
 
+/**
+ * An authentication failure. Always answered 401, and the code goes to the log,
+ * never to the response (contract rule `reason_is_not_returned`).
+ */
 class TokenVerificationError extends Error {
   constructor(message, code) {
     super(message);
     this.name = 'TokenVerificationError';
     this.code = code;
+    this.httpStatus = 401;
   }
 }
 
@@ -75,6 +86,10 @@ class TokenVerificationError extends Error {
  *                                       DEFAULT_MAX_TOKEN_LIFETIME_SEC (2 h); must be a
  *                                       positive number no greater than 24 h. Set it
  *                                       lower per plane to match the issuer.
+ * @param {object}  [opts.entraApp]      { clientId, tenantId }. Plane B with an Entra
+ *                                       issuer: require an APPLICATION token for this
+ *                                       client in this directory (contract rule
+ *                                       `entra_app_token`). createEntraVerifier sets it.
  * @param {number}  [opts.cacheMaxAgeMs] JWKS cache lifetime.
  * @param {object}  [opts.jwksClient]    Injectable key client (tests).
  */
@@ -92,6 +107,7 @@ function createVerifier(opts = {}) {
     maxTokenLifetimeSec = DEFAULT_MAX_TOKEN_LIFETIME_SEC,
     cacheMaxAgeMs = 10 * 60 * 1000,
     jwksClient,
+    entraApp = null,
   } = opts;
 
   if (!issuer) throw new TypeError('createVerifier: issuer is required');
@@ -110,6 +126,12 @@ function createVerifier(opts = {}) {
     throw new TypeError(
       `createVerifier: maxTokenLifetimeSec must be a positive number of seconds no greater than ${MAX_TOKEN_LIFETIME_CEILING_SEC}`
     );
+  }
+
+  if (entraApp !== null) {
+    if (!entraApp || !entraApp.clientId || !entraApp.tenantId) {
+      throw new TypeError('createVerifier: entraApp needs both clientId and tenantId');
+    }
   }
 
   const client =
@@ -153,7 +175,7 @@ function createVerifier(opts = {}) {
 
       jwt.verify(token, getKey, verifyOpts, (err, claims) => {
         if (err) {
-          return reject(new TokenVerificationError(err.message, mapCode(err)));
+          return reject(new TokenVerificationError(err.message, mapCode(err, token, algorithms)));
         }
 
         // Lifetime is checked only once the signature has verified, so these codes
@@ -177,6 +199,11 @@ function createVerifier(opts = {}) {
               'wrong_token_use'
             )
           );
+        }
+
+        if (entraApp) {
+          const appError = checkEntraAppToken(claims, entraApp);
+          if (appError) return reject(appError);
         }
 
         resolve(claims);
@@ -219,6 +246,134 @@ function createVerifier(opts = {}) {
 }
 
 /**
+ * Contract rule `entra_app_token`. Signature, issuer and audience admit any service
+ * principal in the tenant's directory that holds a role — and a USER token too, if
+ * a role was ever made assignable to users, because a user's roles arrive in the
+ * same `roles` claim. That is the Plane A/B confusion returning through a different
+ * claim, so it is a refusal of the TOKEN (401), not of a permission.
+ *
+ * `azp` is the v2 claim and `appid` its v1 predecessor; `azp` is read when present
+ * and `appid` only in its absence, matching the reference tenant service. `idtyp`
+ * is an optional claim the tenant may not have enabled; a delegated token always
+ * carries `scp`, so with no `idtyp` the absence of `scp` stands in for it.
+ */
+function checkEntraAppToken(claims, { clientId, tenantId }) {
+  const client = claims.azp !== undefined ? claims.azp : claims.appid;
+  if (client !== clientId) {
+    return new TokenVerificationError('token was issued to a different client', 'wrong_client');
+  }
+  if (claims.tid !== tenantId) {
+    return new TokenVerificationError('token was issued in a different directory', 'wrong_tenant');
+  }
+  const isApp = claims.idtyp !== undefined ? claims.idtyp === 'app' : claims.scp === undefined;
+  if (!isApp) {
+    return new TokenVerificationError('token is not an application token', 'not_an_app_token');
+  }
+  return null;
+}
+
+/**
+ * The permissions a VERIFIED Plane B token grants, in the contract's vocabulary.
+ *
+ * The caller passes the contract's `permissions` section (token.contract.json) and
+ * this applies it exactly. The package deliberately holds NO copy of the vocabulary
+ * or the Entra role map: the contract is the one place they are agreed, and a copy
+ * here would be a second place for them to drift. Nothing is rewritten — no "dot to
+ * colon", no case folding — because a string rule turns any role somebody adds
+ * later (`orders.read.all`, `Orders.Read`) into a permission nobody reviewed. A
+ * value the section does not name grants nothing (Decision 4: absence denies).
+ *
+ * Each IdP is read from its own claim only (`one_claim_per_idp`): Entra from the
+ * claim its entry names (`roles`) through `map`; Cognito from its claim (`scope`),
+ * keeping only entries under `scopePrefix` + '/'. Neither ever reads the other's.
+ *
+ * Whether the result is ENOUGH is the caller's decision, and a shortfall is a 403,
+ * never a 401 (`insufficient_permission_is_403`): the caller is who they say they
+ * are, and a new token would carry the same grants.
+ *
+ * Call it only with claims `verify` returned; it trusts the signature was checked.
+ *
+ * @param {object} claims
+ * @param {object} opts
+ * @param {object} opts.permissions  token.contract.json `permissions`, as parsed.
+ * @param {string} opts.idp          'entra' | 'cognito' — a key of `permissions.idps`.
+ * @param {string} [opts.scopePrefix] Cognito only: this service's resource-server
+ *                                   identifier, with no trailing '/'.
+ * @returns {string[]} frozen, de-duplicated, in the order the token lists them.
+ */
+function permissionsFor(claims, { permissions, idp, scopePrefix } = {}) {
+  const { vocabulary, profile } = readPermissionsSection(permissions, idp);
+  const granted = new Set();
+
+  if (idp === 'entra') {
+    const map = profile.map;
+    // Not an array — a bare string, say — grants nothing rather than being
+    // coerced: a claim in the wrong shape did not come from Entra's issuance path.
+    const values = Array.isArray(claims[profile.claim]) ? claims[profile.claim] : [];
+    for (const value of values) {
+      // hasOwnProperty, not a plain lookup: a role named `constructor` or
+      // `__proto__` must not resolve to something on Object.prototype.
+      if (typeof value !== 'string' || !Object.prototype.hasOwnProperty.call(map, value)) continue;
+      granted.add(map[value]);
+    }
+  } else {
+    if (typeof scopePrefix !== 'string' || !scopePrefix || scopePrefix.endsWith('/')) {
+      throw new TypeError(
+        "permissionsFor: scopePrefix is required for idp 'cognito' — the resource-server " +
+          "identifier every scope is qualified by, without a trailing '/'"
+      );
+    }
+    const prefix = `${scopePrefix}/`;
+    // RFC 6749 scope is space-delimited. A scope under another resource server is
+    // someone else's grant, and a bare `orders:read` is nobody's.
+    const values = typeof claims[profile.claim] === 'string' ? claims[profile.claim].split(' ') : [];
+    for (const value of values) {
+      if (!value.startsWith(prefix)) continue;
+      const permission = value.slice(prefix.length);
+      if (vocabulary.includes(permission)) granted.add(permission);
+    }
+  }
+
+  return Object.freeze([...granted]);
+}
+
+/**
+ * Refuse a section that is not the contract's shape, loudly and at the first call:
+ * a malformed map would otherwise grant nothing to everyone, which reads as a
+ * tenant's grant problem rather than a wiring mistake here.
+ */
+function readPermissionsSection(permissions, idp) {
+  if (!permissions || typeof permissions !== 'object') {
+    throw new TypeError("permissionsFor: pass the contract's `permissions` section as opts.permissions");
+  }
+  const { vocabulary, idps } = permissions;
+  if (!Array.isArray(vocabulary) || !vocabulary.length || !vocabulary.every((p) => typeof p === 'string')) {
+    throw new TypeError('permissionsFor: permissions.vocabulary must be a non-empty array of strings');
+  }
+  if (idp !== 'entra' && idp !== 'cognito') {
+    throw new TypeError(`permissionsFor: unknown idp ${JSON.stringify(idp)}; expected 'entra' or 'cognito'`);
+  }
+  const profile = idps && Object.prototype.hasOwnProperty.call(idps, idp) ? idps[idp] : null;
+  if (!profile || typeof profile.claim !== 'string' || !profile.claim) {
+    throw new TypeError(`permissionsFor: permissions.idps.${idp}.claim is required`);
+  }
+  if (idp === 'entra') {
+    const { map } = profile;
+    if (!map || typeof map !== 'object' || Array.isArray(map)) {
+      throw new TypeError('permissionsFor: permissions.idps.entra.map is required');
+    }
+    // Every target must be a word of the vocabulary — a map that grants something
+    // the vocabulary does not define is a contract out of step with itself.
+    for (const [role, permission] of Object.entries(map)) {
+      if (!vocabulary.includes(permission)) {
+        throw new TypeError(`permissionsFor: entra map sends ${role} to ${permission}, which is not in the vocabulary`);
+      }
+    }
+  }
+  return { vocabulary, profile };
+}
+
+/**
  * jsonwebtoken checks `exp` only when it is present, and treats a token without
  * one as never expiring. So a correctly signed token with no `exp` — or with one
  * set in the year 3000 — was accepted for ever by anything holding a key we trust.
@@ -227,9 +382,12 @@ function createVerifier(opts = {}) {
  *
  * Absence and malformation are treated alike (a string, null, or anything not a
  * finite number is "no exp"): an issuer that cannot write a NumericDate has not
- * told us when the token ends either. The codes match @innovative-augmentation/
- * session, which applies the same rules at the platform's spine, so a log line
- * means the same thing whichever layer refused.
+ * told us when the token ends either. The codes are the contract's (`no_expiry`,
+ * `no_iat`, `lifetime_exceeded`).
+ *
+ * `issued_in_future` too: bounding `exp - iat` alone does not bound how long a token
+ * lives, because a token with `iat` a day short of an `exp` in 2100 satisfies it and
+ * is good for decades. The contract's 2026-10-01 amendment says the same.
  *
  * Returns a TokenVerificationError, or null when the lifetime is acceptable.
  */
@@ -243,7 +401,7 @@ function checkLifetime(claims, { maxTokenLifetimeSec, clockToleranceSec }) {
   if (iat === null) {
     return new TokenVerificationError(
       'token carries no numeric iat, so its lifetime cannot be bounded',
-      'no_issued_at'
+      'no_iat'
     );
   }
 
@@ -261,18 +419,23 @@ function checkLifetime(claims, { maxTokenLifetimeSec, clockToleranceSec }) {
   if (lifetimeSec > maxTokenLifetimeSec) {
     return new TokenVerificationError(
       `token lifetime ${lifetimeSec}s exceeds the ${maxTokenLifetimeSec}s ceiling`,
-      'token_lifetime_exceeded'
+      'lifetime_exceeded'
     );
   }
 
   return null;
 }
 
+function headerAlg(token) {
+  const decoded = jwt.decode(token, { complete: true });
+  return decoded && decoded.header ? decoded.header.alg : undefined;
+}
+
 function numericDate(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function mapCode(err) {
+function mapCode(err, token, algorithms) {
   // jsonwebtoken refuses a present-but-non-numeric `exp` itself, before our own
   // check runs. Same failure as a missing one, so the same code.
   if (err.message === 'invalid exp value') return 'no_expiry';
@@ -284,6 +447,14 @@ function mapCode(err) {
   if (/public key callback/i.test(err.message)) {
     if (/no kid/i.test(err.message)) return 'no_kid';
     return 'key_lookup_failed';
+  }
+  // An unsigned token (`alg: none`) arrives as a missing signature, not as a
+  // disallowed algorithm, because jsonwebtoken looks at the empty signature segment
+  // before the allow-list. The contract's code for it is algorithm_mismatch. The
+  // header is read here only to NAME a rejection that has already happened — it is
+  // never consulted to decide what to trust.
+  if (err.message === 'jwt signature is required') {
+    return algorithms.includes(headerAlg(token)) ? 'invalid_token' : 'algorithm_mismatch';
   }
   if (/audience/i.test(err.message)) return 'audience_mismatch';
   if (/issuer/i.test(err.message)) return 'issuer_mismatch';
@@ -310,13 +481,22 @@ function createCognitoAccessTokenVerifier({ region, userPoolId, clientId, ...res
 /**
  * Plane B convenience wrapper. The tenant's directory is the issuer — not ours.
  * Entra uses the standard `aud` claim, so the generic defaults apply.
+ *
+ * `clientId` is the PLATFORM's application (client) id in the tenant's directory.
+ * Required: without it the verifier would accept any service principal in that
+ * directory that holds a role (contract rule `entra_app_token`).
  */
-function createEntraVerifier({ tenantId, audience, ...rest }) {
+function createEntraVerifier({ tenantId, audience, clientId, ...rest }) {
+  if (!tenantId) throw new TypeError('createEntraVerifier: tenantId is required');
+  if (!clientId) throw new TypeError('createEntraVerifier: clientId is required');
   return createVerifier({
     issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
     audience,
     jwksUri: `https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`,
     ...rest,
+    // After `rest`, so no option can switch it off: it is what makes this a Plane B
+    // Entra verifier rather than a generic one.
+    entraApp: { clientId, tenantId },
   });
 }
 
@@ -324,6 +504,7 @@ module.exports = {
   createVerifier,
   createCognitoAccessTokenVerifier,
   createEntraVerifier,
+  permissionsFor,
   TokenVerificationError,
   DEFAULT_MAX_TOKEN_LIFETIME_SEC,
   MAX_TOKEN_LIFETIME_CEILING_SEC,

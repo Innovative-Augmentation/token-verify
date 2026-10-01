@@ -254,7 +254,7 @@ test('LIFETIME: rejects a non-numeric exp (string and null)', async () => {
 test('LIFETIME: rejects a token with no iat', async () => {
   const v = cognitoVerifier();
   const token = signRaw({ ...baseClaims(), exp: nowSec() + 300 });
-  await assert.rejects(() => v.verify(token), (e) => e.code === 'no_issued_at');
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'no_iat');
 });
 
 test('LIFETIME: rejects a non-numeric iat (string and null)', async () => {
@@ -263,7 +263,7 @@ test('LIFETIME: rejects a non-numeric iat (string and null)', async () => {
   const v = cognitoVerifier();
   for (const iat of [String(nowSec()), null]) {
     const token = signRaw({ ...baseClaims(), iat, exp: nowSec() + 300 });
-    await assert.rejects(() => v.verify(token), (e) => e.code === 'no_issued_at', `iat=${JSON.stringify(iat)}`);
+    await assert.rejects(() => v.verify(token), (e) => e.code === 'no_iat', `iat=${JSON.stringify(iat)}`);
   }
 });
 
@@ -273,13 +273,13 @@ test('LIFETIME: rejects a ten-year token', async () => {
     { sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' },
     { signOpts: { expiresIn: '3650d' } }
   );
-  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'lifetime_exceeded');
 });
 
 test('LIFETIME: rejects a token expiring in the year 3000', async () => {
   const v = cognitoVerifier();
   const token = signRaw({ ...baseClaims(), iat: nowSec(), exp: Date.UTC(3000, 0, 1) / 1000 });
-  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'lifetime_exceeded');
 });
 
 test('LIFETIME: rejects an iat pushed into the future to shrink exp - iat', async () => {
@@ -307,7 +307,7 @@ test('LIFETIME: the ceiling is inclusive — exactly max passes, one second over
   await v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 3600 }));
   await assert.rejects(
     () => v.verify(signRaw({ ...baseClaims(), iat, exp: iat + 3601 })),
-    (e) => e.code === 'token_lifetime_exceeded'
+    (e) => e.code === 'lifetime_exceeded'
   );
 });
 
@@ -323,7 +323,7 @@ test('LIFETIME: the default admits a genuine Entra-shaped token (90 min + 5 min 
 test('LIFETIME: a plane can set the ceiling lower than the default', async () => {
   const v = cognitoVerifier({ maxTokenLifetimeSec: 30 * 60 });
   const token = sign({ sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' }, { signOpts: { expiresIn: '60m' } });
-  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'lifetime_exceeded');
 });
 
 test('LIFETIME: the wrappers pass maxTokenLifetimeSec through', async () => {
@@ -335,7 +335,7 @@ test('LIFETIME: the wrappers pass maxTokenLifetimeSec through', async () => {
     maxTokenLifetimeSec: 60,
   });
   const token = sign({ sub: 'user-1', client_id: CLIENT_ID, token_use: 'access' });
-  await assert.rejects(() => v.verify(token), (e) => e.code === 'token_lifetime_exceeded');
+  await assert.rejects(() => v.verify(token), (e) => e.code === 'lifetime_exceeded');
 });
 
 test('LIFETIME: a forged token with no exp still fails on its signature, not its lifetime', async () => {
