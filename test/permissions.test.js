@@ -13,10 +13,20 @@ const assert = require('node:assert');
 
 const { permissionsFor } = require('../src/index.js');
 
-// The `permissions` section of the token contract (v1, amended 2026-10-01), as a
+// The `permissions` section of the token contract (v1, amended 2026-10-01, 10-02 and 10-08), as a
 // consumer would parse it. Only the fields permissionsFor reads.
 const CONTRACT_PERMISSIONS = Object.freeze({
-  vocabulary: ['orders:read', 'customers:read', 'vehicles:read', 'drivers:read', 'telemetry:read', 'loads:write'],
+  vocabulary: [
+    'orders:read',
+    'customers:read',
+    'vehicles:read',
+    'drivers:read',
+    'telemetry:read',
+    'loads:write',
+    'loads:cancel',
+    'load_benchmarks:read',
+    'supply_locations:read',
+  ],
   idps: {
     cognito: { claim: 'scope' },
     entra: {
@@ -28,6 +38,9 @@ const CONTRACT_PERMISSIONS = Object.freeze({
         'drivers.read': 'drivers:read',
         'telemetry.read': 'telemetry:read',
         'loads.write': 'loads:write',
+        'loads.cancel': 'loads:cancel',
+        'loads.benchmarks.read': 'load_benchmarks:read',
+        'supply_locations.read': 'supply_locations:read',
       },
     },
   },
@@ -37,6 +50,51 @@ const SCOPE_PREFIX = 'https://capabilities.test.invalid';
 const entra = (claims) => permissionsFor(claims, { permissions: CONTRACT_PERMISSIONS, idp: 'entra' });
 const cognito = (claims) =>
   permissionsFor(claims, { permissions: CONTRACT_PERMISSIONS, idp: 'cognito', scopePrefix: SCOPE_PREFIX });
+
+// ── The snapshot itself ────────────────────────────────────────────────────────
+
+test('SNAPSHOT: nine permissions and nine Entra roles, including the 10-02 and 10-08 amendments', () => {
+  // Pinned here so that dropping an entry from the snapshot fails loudly instead of
+  // quietly shrinking what the tests below cover.
+  assert.equal(CONTRACT_PERMISSIONS.vocabulary.length, 9);
+  assert.equal(Object.keys(CONTRACT_PERMISSIONS.idps.entra.map).length, 9);
+  assert.deepEqual(
+    Object.fromEntries(
+      ['loads.cancel', 'loads.benchmarks.read', 'supply_locations.read'].map((r) => [r, CONTRACT_PERMISSIONS.idps.entra.map[r]])
+    ),
+    {
+      'loads.cancel': 'loads:cancel',
+      'loads.benchmarks.read': 'load_benchmarks:read',
+      'supply_locations.read': 'supply_locations:read',
+    }
+  );
+});
+
+test('ENTRA: the amended roles grant their own permission (note loads.benchmarks.read, not load_benchmarks.read)', () => {
+  assert.deepEqual(entra({ roles: ['loads.cancel'] }), ['loads:cancel']);
+  assert.deepEqual(entra({ roles: ['loads.benchmarks.read'] }), ['load_benchmarks:read']);
+  assert.deepEqual(entra({ roles: ['supply_locations.read'] }), ['supply_locations:read']);
+  // The role one might guess from the permission name is not in the map.
+  assert.deepEqual(entra({ roles: ['load_benchmarks.read', 'loads.benchmarks'] }), []);
+});
+
+test('COGNITO: the amended scopes are granted by their audience-prefixed form, and only that', () => {
+  assert.deepEqual(
+    [...cognito({ scope: `${SCOPE_PREFIX}/loads:cancel ${SCOPE_PREFIX}/load_benchmarks:read ${SCOPE_PREFIX}/supply_locations:read` })],
+    ['loads:cancel', 'load_benchmarks:read', 'supply_locations:read']
+  );
+  assert.deepEqual(cognito({ scope: 'loads:cancel load_benchmarks:read supply_locations:read' }), []);
+  assert.deepEqual(cognito({ scope: `${SCOPE_PREFIX}/loads.cancel ${SCOPE_PREFIX}/supply_locations.read` }), []);
+});
+
+test('A string `roles` grants nothing, and an unknown role or scope grants nothing', () => {
+  assert.deepEqual(entra({ roles: 'loads.cancel supply_locations.read' }), []);
+  assert.deepEqual(entra({ roles: 'loads.cancel' }), []);
+  assert.deepEqual(entra({ roles: ['loads.cancel.all', 'supply_locations.write'] }), []);
+  assert.deepEqual(cognito({ scope: `${SCOPE_PREFIX}/supply_locations:write ${SCOPE_PREFIX}/loads:delete` }), []);
+  // Cognito reads `scope`, never `roles`, even a well-formed one.
+  assert.deepEqual(cognito({ roles: ['loads.cancel'] }), []);
+});
 
 // ── Entra: the exact map ───────────────────────────────────────────────────────
 

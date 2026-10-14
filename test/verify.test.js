@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const {
   createVerifier,
   createCognitoAccessTokenVerifier,
+  createEntraVerifier,
   DEFAULT_MAX_TOKEN_LIFETIME_SEC,
 } = require('../src/index.js');
 
@@ -291,10 +292,10 @@ test('LIFETIME: rejects an iat pushed into the future to shrink exp - iat', asyn
 });
 
 test('LIFETIME: an iat within clock tolerance is accepted, just beyond it is not', async () => {
-  const v = cognitoVerifier({ clockToleranceSec: 30 });
-  const within = nowSec() + 20;
+  const v = cognitoVerifier({ clockToleranceSec: 5 });
+  const within = nowSec() + 3;
   await v.verify(signRaw({ ...baseClaims(), iat: within, exp: within + 300 }));
-  const beyond = nowSec() + 60;
+  const beyond = nowSec() + 30;
   await assert.rejects(
     () => v.verify(signRaw({ ...baseClaims(), iat: beyond, exp: beyond + 300 })),
     (e) => e.code === 'issued_in_future'
@@ -356,4 +357,60 @@ test('config: maxTokenLifetimeSec must be a positive finite number no greater th
   }
   assert.ok(createVerifier({ ...base, maxTokenLifetimeSec: 24 * 3600 }));
   assert.ok(createVerifier({ ...base, maxTokenLifetimeSec: 1 }));
+});
+
+test('config: clockToleranceSec is capped at the contract\'s 5 seconds, on every construction path', () => {
+  const base = { issuer: 'i', audience: 'a', jwksClient: fakeJwks };
+  for (const bad of [5.5, 6, 30, 300, -1, NaN, Infinity, null, '5']) {
+    assert.throws(
+      () => createVerifier({ ...base, clockToleranceSec: bad }),
+      /clockToleranceSec.*expiry_enforced/,
+      `createVerifier clockToleranceSec=${String(bad)}`
+    );
+  }
+  assert.throws(
+    () =>
+      createCognitoAccessTokenVerifier({
+        region: 'eu-west-2',
+        userPoolId: 'eu-west-2_TEST',
+        clientId: CLIENT_ID,
+        jwksClient: fakeJwks,
+        clockToleranceSec: 6,
+      }),
+    /clockToleranceSec/
+  );
+  assert.throws(
+    () =>
+      createEntraVerifier({
+        tenantId: 'tenant',
+        audience: 'api://x',
+        clientId: 'client',
+        jwksClient: fakeJwks,
+        clockToleranceSec: 60,
+      }),
+    /clockToleranceSec/
+  );
+  for (const ok of [0, 1, 5]) {
+    assert.ok(createVerifier({ ...base, clockToleranceSec: ok }), String(ok));
+  }
+  assert.ok(createVerifier(base)); // the default (5) is within the cap
+});
+
+test('NBF: with the default 5 s tolerance, +30 s is not_yet_valid and +3 s is accepted', async () => {
+  const v = cognitoVerifier();
+  const iat = nowSec();
+  await assert.rejects(
+    () => v.verify(signRaw({ ...baseClaims(), iat, nbf: iat + 30, exp: iat + 300 })),
+    (e) => e.code === 'not_yet_valid'
+  );
+  await v.verify(signRaw({ ...baseClaims(), iat, nbf: iat + 3, exp: iat + 300 }));
+});
+
+test('NBF: a tolerance of 0 refuses even a +3 s nbf', async () => {
+  const v = cognitoVerifier({ clockToleranceSec: 0 });
+  const iat = nowSec();
+  await assert.rejects(
+    () => v.verify(signRaw({ ...baseClaims(), iat, nbf: iat + 3, exp: iat + 300 })),
+    (e) => e.code === 'not_yet_valid'
+  );
 });

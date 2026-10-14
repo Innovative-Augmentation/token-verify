@@ -4,7 +4,7 @@ Shared JWT verification. **One implementation, consumed by both repos** — the 
 `ne-scheduling`. That is the whole point of it being a package: the ADR ([`plans/auth.md`](../../plans/auth.md))
 chose in-app middleware over gateway validation specifically so the two sides cannot drift apart.
 
-It implements the **token contract** (`contracts/v1/token.contract.json`, v1 as amended 2026-10-01):
+It implements the **token contract** (`contracts/v1/token.contract.json`, v1 as amended 2026-10-01, 2026-10-02 and 2026-10-08):
 the checks, and the contract's rejection codes, so a log line means the same thing whichever
 implementation wrote it.
 
@@ -105,7 +105,7 @@ expected.
 | Option | Default | Notes |
 |---|---|---|
 | `maxTokenLifetimeSec` | `7200` (2 h) | Ceiling on `exp - iat`. Must be a positive number ≤ `86400`; anything else throws at construction. **Set it lower per plane** to match the issuer. |
-| `clockToleranceSec` | `5` | Applied to `exp`, `nbf` and the future-`iat` check alike. Not applied to `exp - iat`, which is the issuer's own arithmetic. |
+| `clockToleranceSec` | `5` | Applied to `exp`, `nbf` and the future-`iat` check alike. Not applied to `exp - iat`, which is the issuer's own arithmetic. Must be a number from `0` to `5` (the contract's `expiry_enforced` ceiling); anything else throws at construction. |
 
 Two hours sits just above the longest *default* lifetime of either issuer: Cognito access tokens
 default to 60 min (the platform pool issues 30), and Entra access tokens are a random 60–90 min
@@ -170,7 +170,7 @@ place for them to drift. `permissionsFor` applies the section exactly:
 | Entra | `roles` (an array) | exact lookup in the section's `map`; anything else dropped |
 | Cognito | `scope` (a space-separated string) | keep entries starting `<scopePrefix>/`, strip that, keep exact members of `vocabulary` |
 
-The map as the contract states it today:
+The map as the contract states it today (v1 as amended 2026-10-01, 2026-10-02 and 2026-10-08):
 
 | Entra app role | Permission |
 |---|---|
@@ -180,6 +180,14 @@ The map as the contract states it today:
 | `drivers.read` | `drivers:read` |
 | `telemetry.read` | `telemetry:read` |
 | `loads.write` | `loads:write` |
+| `loads.cancel` | `loads:cancel` |
+| `loads.benchmarks.read` | `load_benchmarks:read` |
+| `supply_locations.read` | `supply_locations:read` |
+
+`loads.cancel` and `loads.benchmarks.read` were added by the 2026-10-02 amendment and
+`supply_locations.read` by the 2026-10-08 one. Note the role `loads.benchmarks.read` maps to the
+permission `load_benchmarks:read`; `load_benchmarks.read` is not a role. For Cognito the same nine
+permissions are granted as `<audience>/<permission>` scopes.
 
 - **Nothing is rewritten.** No "dot to colon", no case folding: `Orders.Read`, `orders.read.all` and a
   bare `orders:read` in `roles` all grant nothing. A string rule would turn any role somebody adds
@@ -220,12 +228,14 @@ lifetime and the rest of the contract's 2026-10-01 amendment. What you must chan
      Pass `maxTokenLifetimeSec` explicitly if an issuer is configured longer, and justify it;
    - on Entra: another client (`wrong_client`), another directory (`wrong_tenant`), or a user or
      delegated token (`not_an_app_token`).
-3. **A changed code**: an unsigned (`alg: none`) token is now `algorithm_mismatch`, not
+3. **`clockToleranceSec` is capped at 5** (the contract allows at most 5 seconds). A larger value
+   now throws at construction. Remove it, or lower it to 5 or less.
+4. **A changed code**: an unsigned (`alg: none`) token is now `algorithm_mismatch`, not
    `invalid_token`. Alerts or dashboards keyed on the old code need updating.
-4. **Permissions, if you read them yourself**: replace your own role or scope parsing with
+5. **Permissions, if you read them yourself**: replace your own role or scope parsing with
    `permissionsFor(claims, { permissions, idp })`, passing the contract's `permissions` section, and
    answer a missing permission with **403**, never 401.
-5. **Names changed while 0.3.0 was unreleased.** Anything written against the 0.3.0 branch before
+6. **Names changed while 0.3.0 was unreleased.** Anything written against the 0.3.0 branch before
    this change and matching on `no_issued_at` or `token_lifetime_exceeded` must match `no_iat` and
    `lifetime_exceeded`, the contract's names.
 
@@ -238,9 +248,9 @@ token, and `entra_app_token` does not apply.
 npm test
 ```
 
-No network: a fake JWKS client is injected via the `jwksClient` option, and every key is
+No network beyond loopback: a fake JWKS client is injected via the `jwksClient` option, and every key is
 generated per run. Coverage includes the forgery paths (`alg: none`, wrong signing key, mismatched
-issuer/audience, expired, missing `kid`), the lifetime rules (no `exp`, non-numeric `exp`/`iat`,
+issuer/audience, expired, missing `kid`), the `clockToleranceSec` cap, `nbf` with and without tolerance, JWKS rotation, kid misses and rate-limit exhaustion (against a local JWKS server on loopback), the lifetime rules (no `exp`, non-numeric `exp`/`iat`,
 missing `iat`, ten-year and year-3000 tokens, future `iat`, the ceiling boundary), every
 `entra_app_token` case, `permissionsFor` against the contract's section and against altered
 sections (to prove the map comes from the caller), and an explicit plane-separation case asserting

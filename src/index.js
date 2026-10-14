@@ -21,7 +21,7 @@
  * server-side per request (P1.4/P1.7).
  *
  * The checks are those of the token contract (token.contract.json, v1 as amended
- * 2026-10-01). Error codes are the contract's `rejection_codes`, so a log line means
+ * 2026-10-01, 10-02 and 10-08). Error codes are the contract's `rejection_codes`, so a log line means
  * the same thing whichever implementation wrote it.
  */
 
@@ -54,6 +54,15 @@ const DEFAULT_MAX_TOKEN_LIFETIME_SEC = 2 * 60 * 60;
 const MAX_TOKEN_LIFETIME_CEILING_SEC = 24 * 60 * 60;
 
 /**
+ * The most `clockToleranceSec` may be raised to. The token contract's
+ * `expiry_enforced` rule allows a clock tolerance of AT MOST 5 seconds: tolerance
+ * is for skew between two servers, and minutes of it is an expiry that does not
+ * expire. It applies to `exp`, `nbf` and the future-`iat` check alike, so a larger
+ * value is refused at construction rather than honoured.
+ */
+const MAX_CLOCK_TOLERANCE_SEC = 5;
+
+/**
  * An authentication failure. Always answered 401, and the code goes to the log,
  * never to the response (contract rule `reason_is_not_returned`).
  */
@@ -82,6 +91,7 @@ class TokenVerificationError extends Error {
  * @param {string[]}[opts.algorithms]    Permitted algorithms. Defaults to RS256 only.
  * @param {number}  [opts.clockToleranceSec] Allowed skew, applied to `exp`, `nbf` and
  *                                       the issued-in-the-future check on `iat`.
+ *                                       0 to 5 (the contract's ceiling); more throws.
  * @param {number}  [opts.maxTokenLifetimeSec] Ceiling on `exp - iat`. Defaults to
  *                                       DEFAULT_MAX_TOKEN_LIFETIME_SEC (2 h); must be a
  *                                       positive number no greater than 24 h. Set it
@@ -125,6 +135,19 @@ function createVerifier(opts = {}) {
   ) {
     throw new TypeError(
       `createVerifier: maxTokenLifetimeSec must be a positive number of seconds no greater than ${MAX_TOKEN_LIFETIME_CEILING_SEC}`
+    );
+  }
+
+  // Same reasoning as above. The contract (rule `expiry_enforced`) allows at most
+  // 5 seconds, so a larger value is a configuration that is not conformant.
+  if (
+    typeof clockToleranceSec !== 'number' ||
+    !Number.isFinite(clockToleranceSec) ||
+    clockToleranceSec < 0 ||
+    clockToleranceSec > MAX_CLOCK_TOLERANCE_SEC
+  ) {
+    throw new TypeError(
+      `createVerifier: clockToleranceSec must be a number of seconds from 0 to ${MAX_CLOCK_TOLERANCE_SEC} (token contract, rule expiry_enforced: a clock tolerance of at most 5 seconds)`
     );
   }
 
